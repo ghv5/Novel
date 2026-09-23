@@ -1,0 +1,244 @@
+# 03 · 工具系统：六阶段生命周期与内置工具
+
+> 工具是 agent 的"手"。本文拆解工具从 LLM 返回到执行完成的完整生命周期。
+
+源码：`packages/agent/src/types.ts`（接口定义）、`packages/agent/src/agent-loop.ts`（执行逻辑）、`packages/agent/src/harness/tools/`（内置工具实现）。
+
+## 3.1 工具接口：AgentTool
+
+```typescript
+// types.ts L380-425
+interface AgentTool<TParameters, TDetails> extends Tool<TParameters> {
+    label: string;                    // 人类可读标签
+    prepareArguments?: (args) => TParameters;  // 兼容性整形（raw → schema）
+    execute: (toolCallId, params, signal?, onUpdate?) => Promise<AgentToolResult<TDetails>>;
+    replay?: "never" | "safe";       // 恢复策略：恢复时是否重新执行
+    executionMode?: "sequential" | "parallel";  // 工具级执行模式覆盖
+}
+
+// types.ts L420
+interface AgentToolResult<T> {
+    content: (TextContent | ImageContent)[];
+    details?: T;
+    usage?: TokenUsage;
+    terminate?: boolean;              // 是否终止 agent（批级规则：全部 terminate 才终止）
+}
+```
+
+**harness 层再包一层**：`AgentHarnessTool`（`harness/types.ts` L108-124）把 `execute` 签名扩展为：
+
+```typescript
+execute(toolCallId, params, onUpdate, toolContext, invocation, context)
+```
+
+多出的 `toolContext` 由 `AgentHarnessToolContextSource` 每轮快照，`invocation` 携带调用元数据。**为什么**：低层 `AgentTool` 是通用契约（不依赖 harness），`AgentHarnessTool` 是 harness 特化（携带会话上下文、文件修改队列等）。
+
+## 3.2 六阶段生命周期
+
+```
+LLM 返回 toolCall
+  │
+  ├─ 阶段 1: prepareToolCall (L683)
+  │    ├─ 查找工具（context.tools 中按 name 匹配）
+  │    ├─ prepareToolCallArguments → tool.prepareArguments（兼容性整形）
+  │    ├─ validateToolArguments（TypeBox schema 校验）
+  │    └─ beforeToolCall 钩子 → 可 block / 可 terminate
+  │    结果: prepared / immediate（block 时直接返回 error result）
+  │
+  ├─ 阶段 2: executePreparedToolCall (L759)
+  │    ├─ 调 tool.execute(id, args, signal, onUpdate)
+  │    ├─ onUpdate 回调 → emit tool_execution_update（流式进度）
+  │    └─ 异常捕获 → 转为 error tool result
+  │
+  ├─ 阶段 3: finalizeExecutedToolCall (L799)
+  │    └─ afterToolCall 钩子 → 可字段级覆盖 content/details/isError/usage/terminate
+  │
+  └─ 生成 toolResult 消息 → push 进 context → emit message_start/end
+```
+
+### beforeToolCall 钩子
+
+```typescript
+// types.ts L64
+interface BeforeToolCallResult {
+    block?: boolean;      // true 则不执行，返回 reason
+    reason?: string;      // block 原因（回给模型）
+    terminate?: boolean;  // true 则标记终止
+}
+```
+
+**场景**：安全审查（"这个 bash 命令包含 `rm -rf`，block 并告诉模型"）、权限检查、审计日志。
+
+### afterToolCall 钩子
+
+```typescript
+// types.ts L81
+interface AfterToolCallResult {
+    content?: (TextContent | ImageContent)[];
+    details?: any;
+    isError?: boolean;
+    usage?: TokenUsage;
+    terminate?: boolean;
+}
+```
+
+**场景**：结果后处理（如 edit 工具返回 diff 统计）、用量统计、强制终止。
+
+## 3.3 sequential vs parallel 执行模式
+
+```typescript
+// agent-loop.ts L505-519 (executeToolCalls)
+function executeToolCalls(context, message, config, signal, emit) {
+    const isSequential = config.toolExecution === "sequential" 
+        || toolCalls.some(tc => findTool(tc.name)?.executionMode === "sequential");
+    return isSequential 
+        ? executeToolCallsSequential(...) 
+        : executeToolCallsParallel(...);
+}
+```
+
+**判定规则**：config 全局设为 sequential，**或**批内任一工具声明 `executionMode: "sequential"`，则整批顺序执行。否则并行。
+
+### 顺序模式
+
+```typescript
+// L523-563
+for (const toolCall of toolCalls) {
+    emit tool_execution_start
+    prepare → execute → finalize
+    emit tool_execution_end
+}
+// 消息按源序 emit
+```
+
+### 并行模式
+
+```typescript
+// L565-614
+// 1. 顺序 preflight（prepare 所有工具）
+for (const toolCall of toolCalls) {
+    emit tool_execution_start
+    prepared = prepareToolCall(...)
+    if (immediate) { 同步处理结果 }
+}
+// 2. 并发 execute
+const results = await Promise.all(prepared.map(p => executePreparedToolCall(p)))
+// 3. 按源序生成 toolResult 消息
+// 但 tool_execution_end 按完成顺序发射！
+```
+
+**关键细节**：`tool_execution_end` 事件按**完成顺序**发（谁先完成谁先发），但 `toolResult` 消息按**源码顺序**发（与 assistant 消息中 toolCall 的顺序一致）。这个差异对 UI 渲染很重要：
+- UI 用 `tool_execution_end` 更新"哪个工具完成了"（实时）
+- 消息列表用 `toolResult` 消息的顺序保持与 assistant 输出一致
+
+## 3.4 批级终止规则
+
+```typescript
+// agent-loop.ts L846
+function shouldTerminateToolBatch(results) {
+    return results.length > 0 
+        && results.every(r => r.terminate === true);
+}
+```
+
+**语义**：单个工具不能独自终止 agent。必须**所有**工具结果都 `terminate === true` 才终止。
+
+**为什么**：模型可能同时发出两个 tool call（如"读文件 A" + "读文件 B"），如果 A 的 terminate=true 但 B 的 terminate=false，说明模型还想要 B 的结果。只有当模型"所有操作都完成了"时才终止。
+
+## 3.5 内置工具清单
+
+`packages/agent/src/harness/tools/index.ts` 导出 8 个内置工具：
+
+| 工具 | 文件 | 功能 | replay |
+|------|------|------|--------|
+| `read` | `read.ts` | 读文件（文本/图片/二进制三分支，截断保护） | safe |
+| `write` | `write.ts` | 写文件（创建/覆盖） | never |
+| `edit` | `edit.ts` + `edit-diff.ts` | 编辑文件（精确替换） | never |
+| `bash` | `bash.ts` | 执行 shell 命令 | never |
+| `powershell` | `powershell.ts` | 执行 PowerShell 命令 | never |
+| `grep` | `grep.ts`（coding-agent 侧） | 正则搜索文件内容 | safe |
+| `find` | `find.ts`（coding-agent 侧） | 按 glob 搜索文件 | safe |
+| `ls` | `ls.ts`（coding-agent 侧） | 列目录 | safe |
+
+**组合方式**：
+- `createCodingTools()`：read + bash + edit + write（编码模式）
+- `createReadOnlyToolDefinitions()`：read + grep + find + ls（只读模式）
+
+### read 工具示例
+
+```typescript
+// harness/tools/read.ts
+function createReadTool(context) {
+    return {
+        name: "read",
+        label: "Read File",
+        description: "Read the contents of a file",
+        parameters: Type.Object({
+            path: Type.String({ description: "Absolute path" }),
+            startLine: Type.Optional(Type.Number()),
+            endLine: Type.Optional(Type.Number()),
+        }),
+        replay: "safe",  // 恢复时可安全重放
+        execute: async (id, params, signal, onUpdate) => {
+            // 路径解析 → 二进制/图片/文本三分支
+            // 文本: 截断 DEFAULT_MAX_LINES / DEFAULT_MAX_BYTES
+            // 图片: imageProcessor 注入
+            return { content: [{ type: "text", text: ... }] };
+        }
+    };
+}
+```
+
+## 3.6 文件修改队列（file-mutation-queue）
+
+`harness/tools/file-mutation-queue.ts` 解决**并发写冲突**：
+
+```
+并行模式下，两个 edit 工具同时修改同一文件
+  → file-mutation-queue 串行化写操作
+  → 按调用顺序逐个应用
+  → 避免竞态条件
+```
+
+**设计**：写操作入队 → 按序执行 → 每个写完成后释放锁。读操作不受影响（可并发）。
+
+## 3.7 工具扩展：自定义工具
+
+宿主（如 coding-agent CLI）可以通过 `AgentLoopConfig.tools` 注入自定义工具：
+
+```typescript
+const agent = new Agent({
+    tools: [
+        ...builtinTools,
+        myCustomTool,  // 任何符合 AgentTool 接口的对象
+    ],
+    beforeToolCall: async (ctx) => {
+        if (ctx.toolCall.name === "bash" && /rm -rf/.test(ctx.toolCall.arguments.command)) {
+            return { block: true, reason: "危险命令已被安全策略阻止" };
+        }
+    },
+});
+```
+
+**扩展点**：
+1. 自定义工具实现（实现 `AgentTool` 接口）
+2. `beforeToolCall` 拦截（安全/权限/审计）
+3. `afterToolCall` 后处理（统计/转换/强制终止）
+4. `prepareArguments` 参数整形（兼容不同 provider 的参数格式）
+
+## 3.8 核心设计总结
+
+| 设计决策 | 原因 |
+|---------|------|
+| 六阶段生命周期 | 每个阶段可独立拦截/修改，职责清晰 |
+| before/after 钩子 | 安全审查、统计、后处理不侵入工具实现 |
+| 批级 terminate（全部才终止） | 单个工具不能代表模型"完成" |
+| 并行 preflight + 源序消息 | 并发执行效率 + 消息顺序一致性 |
+| file-mutation-queue | 并发写安全 |
+| replay 策略 | 恢复时区分"可重放"（读）和"不可重放"（写/bash） |
+| AgentTool vs AgentHarnessTool 分层 | 通用契约与 harness 特化解耦 |
+
+## 延伸阅读
+
+- 02 文：主循环中工具调用的提取与截断保护
+- 06 文：beforeToolCall/afterToolCall 钩子的完整契约

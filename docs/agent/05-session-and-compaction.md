@@ -1,0 +1,92 @@
+# 05 · 会话管理与上下文压缩
+
+> 长会话的两大难题：如何持久化并支持"分支/回退"，以及如何在不丢失关键信息的前提下压缩上下文。
+> Pi 在 `packages/agent/src/harness/session/` 和 `harness/compaction/` 给出了生产级答案。
+
+## 5.1 会话底层数据模型
+
+会话由 `StorageBackedSession` + 一个 `Storage` 后端组成，底层是 `InMemoryStorageState`：
+
+- **entries**：每个条目带 `parentId`，共同构成一棵**分支树**——会话不是线性的，而是可 fork 的树。
+- **`scalarValues` / `listValues`**：用 `namespace:key` 寻址的 KV 存储，承载元数据。
+- **保留命名空间**（见 `session/values.ts`）：
+  - `pi.branch.tip` —— 每个分支的当前 tip
+  - `pi.lane.config` / `pi.lane.state` —— 执行 lane 状态
+  - `pi.session.name` —— 会话名
+  - `pi.result`、`pi.op.*`、`pi.pending.*` —— 结果与运行时状态
+
+### 双存储后端
+
+- `MemoryStorage`（`session/memory.ts`）：内存态，`commit` 走 `commitQueue` 串行化。
+- `JsonlStorage`（`session/jsonl/storage.ts`）：JSONL 文件后端，支持 `{kind:"v4"}` 与 `{kind:"v3"; source}` 两种格式，`open()` 时自动做 v3→v4 迁移，并处理写入中断产生的"撕裂行"（`splitCompleteLines`）。
+
+### 事务式 mutation
+
+`StorageBackedSessionMutation`（`session/session.ts`）以事务方式提交变更：`commit` 阶段**拒绝落盘 `stopReason === "pending"` 的 assistant 消息**（即流式未完成的消息不能持久化），`end` 阶段 settle + release。自定义异常（`SessionInvariantError`、`SessionBranchExistsError`、`SessionPendingAssistantMessageError` 等）保证不变量被违反时快速失败。
+
+## 5.2 分支 / fork 逻辑
+
+fork 的完整链路：`createFork → selectForkPlan → selectBranchFork`。
+
+- `selectBranchFork`（`session/fork-policy.ts`）：
+  - `position === "before"` 时，destination tip 指向 `requested` 的 parent；
+  - 否则把 `requested` 也复制到 destination。
+- `projectForkCurrentStateWrite` 决定各保留命名空间在 fork 后的投影规则：
+  - `pi.session.name` 保留；
+  - `pi.branch.tip` 在分支场景下按分支改写；
+  - `pi.lane.config`/`pi.lane.state` 重置为 `{currentOperationId:null, lastOperationId:null, inbox:[]}`；
+  - `pi.result` / `pi.op.*` / `pi.pending.*` 丢弃；
+  - 其它 `pi.*` 保留命名空间会**抛错**（防止未知命名空间被静默处理）。
+- `createForkSnapshot`（`session/fork.ts`）从源快照（entries + scalarValues + entriesComplete?）构建目标快照，并用 `validateForkSourceSnapshot` 校验每个分支的 tip/lane 完整性。
+
+**设计意图**：会话是一棵树，"回退 / 换条路重试"本质上是把 tip 指到另一个节点，而不是回滚线性历史。
+
+## 5.3 上下文压缩（compaction）
+
+位置：`harness/compaction/compaction.ts`（约 866 行）。
+
+### 触发条件与默认值
+
+```typescript
+CompactionSettings = {
+  enabled: true,
+  reserveTokens: 16384,    // 为新生成预留的窗口
+  keepRecentTokens: 20000  // 必须保留的最近上下文
+}
+shouldCompact = contextTokens > contextWindow - reserveTokens
+```
+
+### Token 估算策略
+
+`estimateContextTokens`：
+1. 优先采用**最后一条合法 assistant 消息的 provider `usage.totalTokens`**；
+2. 之后每条消息用 `estimateTokens` 累加——user/toolResult/custom/摘要类按 **字符数 / 4** 估算；assistant 消息分别累加 text、thinking、toolCall（name + `JSON.stringify(args)`）；
+3. 图片固定按 `ESTIMATED_IMAGE_CHARS = 4800` 字符估算。
+
+### 切点选取（安全边界）
+
+- `findValidCutPoints`：**只允许在非 toolResult 的消息条目处切**（且允许在 `branch_summary` 处切），`findTurnStartIndex` 向上找 `user`/`bashExecution`/`branch_summary` 定位 turn 起点。绝不能在 toolResult 中间切开（会破坏 tool call / result 配对）。
+- `findCutPoint`：从末尾往前累计估算 token，直到 ≥ `keepRecentTokens`，选第一个满足 `cutPoints[c] >= i` 的切点；再回退跳过连续的非 message/compaction 前驱；返回 `{firstKeptEntryIndex, turnStartIndex, isSplitTurn}`。
+- **split turn**：若切点落在某个 turn 的前半段，则对 turn 前缀单独生成一份 `turn-prefix summary`（`maxTokens = min(0.5*reserveTokens, model.maxTokens)`），最后拼成 `historyText \n\n---\n\n**Turn Context (split turn):**\n\n…`。
+
+### 摘要生成
+
+- 三个内置 prompt：`SUMMARIZATION_SYSTEM_PROMPT`（角色设定）、`SUMMARIZATION_PROMPT`（结构化模板：Goal / Constraints & Preferences / Progress(Done/In Progress/Blocked) / Key Decisions / Next Steps / Critical Context，强调**保留文件路径、函数名、错误消息**）、`UPDATE_SUMMARIZATION_PROMPT`（增量更新 `<previous-summary>`）。
+- `generateSummary` 走 `generateSummaryWithRequest`，由调用方注入"单次请求边界"，并带重试（隔离路由、禁缓存写）。
+- 摘要产物追加 `CompactionDetails{readFiles, modifiedFiles}`：从上一轮 `CompactionEntry.details` 累加，再叠加本轮 `extractFileOpsFromMessage` 提取的文件操作——保证压缩后模型仍知道"读过/改过哪些文件"。
+
+## 5.4 核心设计总结
+
+| 设计决策 | 原因 |
+|---------|------|
+| 会话 = 带 parentId 的分支树 + KV 元数据 | 原生支持 fork / 回退，而非线性回滚 |
+| 事务式 mutation + 拒绝 pending 落盘 | 流式未完成的消息不进入持久层，保证崩溃可恢复 |
+| JSONL + 撕裂行处理 + v3→v4 迁移 | 追加式、可恢复、可平滑升级存储格式 |
+| 压缩切点只在非 toolResult 处 | 不破坏 tool call / result 的配对完整性 |
+| 摘要保留"读/改文件清单" | 压缩后仍保留关键的可恢复线索 |
+| usage 优先 + 字符/4 回退 | 用真实 usage 校准，估算仅作补充 |
+
+## 延伸阅读
+
+- 02 文：主循环中 `prepareNextTurn` 钩子是压缩/换模的注入点
+- 06 文：`transformContext` 钩子如何与压缩协同
