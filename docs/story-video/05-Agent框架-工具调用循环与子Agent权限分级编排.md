@@ -1,18 +1,25 @@
 # 05 Agent 框架：工具调用循环与子 Agent 权限分级编排
 
-> 标签：Agent / Function Calling / 工具循环 / 子 Agent / 权限收敛
+> 标签：Agent / Function Calling / 工具循环 / 子 Agent 编排 / 权限裁剪
+>
+> 证据根：`story-video-agent/src/main/java/io/binghe/framework/ai/agent/**`
 
 ---
 
 ## 1. 场景与边界
 
-平台用 **Agent + Function Calling** 驱动内容生成：主 Agent（如 `NovelMainAgent` 小说主编、`OutlineMainAgent` 大纲主编）通过与 LLM 多轮工具调用，读写业务数据（世界设定、角色、章节、分镜等），并**调用子 Agent** 完成专职子任务。
+平台把「写小说 / 出大纲 / 写剧本 / 落分镜」等任务都建模成 **Agent**，每个 Agent 通过 **Function Calling（工具调用）** 与系统交互。核心需求：
 
-核心工程问题：
-1. **工具调用循环**：LLM 返回 `tool_calls` 后执行工具、把结果回填、再问 LLM，直到无工具调用或达到轮数上限。
-2. **子 Agent 权限分级**：子 Agent 只能拿到**被裁剪过的工具集**，防止它再调用 `call*` 递归编排、也防止越权写数据。
+1. **工具循环**：模型返回 `tool_calls` → 本地执行 → 把结果回填 → 继续问模型，直到模型不再调用工具；
+2. **主/子 Agent 编排**：主 Agent 需要把「写某一章」「串联伏笔」等子任务交给子 Agent，子 Agent 完成后把结果返回主流程；
+3. **权限分级**：子 Agent 拿到的工具集必须被裁剪，**防止子 Agent 反过来调用主 Agent**造成无限递归；
+4. **并发与排队**：同一 Agent 实例同时只能跑一个任务，其余消息排队；
+5. **可观测**：每次 LLM 调用、工具调用、子 Agent 调用都要落日志表（`t_agent_log`）。
 
-边界：本场景讲 `BaseAgent` 的循环与子 Agent 编排；Prompt 组装见第 09 篇，实时事件见第 07 篇。
+边界：
+- 本文聚焦 Agent 运行时骨架（`BaseAgent`）与子 Agent 编排。
+- 具体的 `novelAgent` / `outlineAgent` / `storyboardAgent` 及其工具清单只在证据层面引用。
+- WebSocket 事件推送与 `AgentSession` 生命周期见第 07 篇。
 
 ---
 
@@ -20,65 +27,81 @@
 
 | 难点 | 说明 |
 | --- | --- |
-| 循环必须有上限 | 否则 LLM 可能陷入工具死循环，需 `maxIterations` |
-| 子 Agent 不能递归 | 子 Agent 工具集必须剔除 `call*` 编排类工具 |
-| 工具集按角色裁剪 | 不同子 Agent 职责不同，工具集也不同 |
-| 历史与上下文 | 工具调用记录要进 `messages`，并持久化 |
-| 可观测 | 每次工具调用要落 `t_agent_log` |
-| 暂停/恢复/取消 | 长生成需支持中途控制 |
+| Function Calling 循环终止 | 要区分「模型不再调工具」与「达到最大轮次」，后者不能被误判为成功 |
+| 子 Agent 递归 | 子 Agent 的工具集若含 `callXxx`，会递归回主 Agent |
+| 上下文膨胀 | 每轮工具结果都追加进 messages，20 轮后 token 爆炸 |
+| 单实例并发 | 同一会话连续提问要串行，避免上下文交叉 |
+| 暂停/取消 | 长循环里要能真正中断，而非只改状态标志 |
+| 失败可观测 | LLM 调用失败要落库、要推给前端 |
 
 ---
 
 ## 3. 实现链路
 
-### 3.1 工具循环（`executeWithToolLoop`）
+### 3.1 一次对话的完整链路
 
 ```
-for i in 0..19:                 # maxIterations = 20
-    resp = provider.invokeWithTools(buildAiRequest(messages, tools))
-    if resp.hasToolCalls() == false: 结束（可流式输出）
-    追加 assistant(toolCalls) 到 messages
-    for each toolCall:
-        tool = tools.getTool(name)
-        result = tool.execute(args)
-        log to t_agent_log
-        messages.add(ChatMessage.toolResult(id, result))
-    # 继续循环
+onMessage(userMessage)
+  ├─ synchronized(this)：若 state==RUNNING → messageQueue.enqueue(msg) 并返回（排队）
+  │                     否则 state=RUNNING
+  ├─ history.add(user(msg))
+  ├─ executeWithToolLoop(history, toolRegistry, isSubAgent=false)
+  │    └─ for i in 0..19:
+  │         ├─ buildAiRequest(messages, tools)           ← 注入系统提示 + 工具定义
+  │         ├─ provider = aiProviderService.getTextProvider(getAiFunctionKey())
+  │         ├─ aiRetryTemplate.execute(() -> provider.invokeWithTools(request))
+  │         ├─ logAction("llmCall", ...)
+  │         ├─ 流式推送文本（主 Agent → emitter.stream；子 Agent → emitter.subAgentStream）
+  │         ├─ 若 !response.hasToolCalls():
+  │         │     messages.add(assistant(text)); emitter.responseEnd / subAgentEnd; return  ← 正常结束
+  │         └─ 对每个 toolCall:
+  │              ├─ tools.getTool(name)；null → 返回 "unknown tool"
+  │              ├─ emitter.toolCall(...)（推前端）
+  │              ├─ 解析 JSON 参数 → tool.execute(args)
+  │              ├─ logAction("toolCall", ...)
+  │              └─ messages.add(toolResult(id, result))
+  │         （20 轮仍未结束 → log.warn，方法返回，无 completion 事件）
+  └─ finally：synchronized 置 state=IDLE；processNextInQueue()
 ```
 
-### 3.2 子 Agent 编排
+### 3.2 子 Agent 编排（权限裁剪的核心）
 
-- `NovelMainAgent` 注册 **7 个子 Agent**：`worldArchitect / characterDesigner / plotArchitect / chapterPlanner / novelWriter / editor / qualityInspector`。【代码事实】
-- `OutlineMainAgent` 注册 **3 个子 Agent**：`storyteller / outliner / director`。【代码事实】
-- 每个 `callXxx` 工具内部调用 `invokeSubAgent(name, task, systemPrompt, subTools)`，`subTools` 由 `buildXxxTools()` 专门构造（**不含 `call*`**）。【代码事实】
+```
+主 Agent 的工具集 = buildXxxTools(...)（业务工具）
+                  + registerCallXxx(...)（“调用某子 Agent” 的入口工具）
+子 Agent 的工具集 = 仅 buildXxxTools(...)（业务工具），不含任何 callXxx
+```
+
+- `invokeSubAgent(name, task, subSystemPrompt, subTools)`：推 `transfer` 事件 → 建子历史（system + user）→ `executeWithToolLoop(subHistory, subTools, true)` → 取**最后一条 assistant 消息**作为结果 → 落 `invokeSubAgent` 日志。
+- 子 Agent 用 `isSubAgent=true`，流式走 `emitter.subAgentStream`，结束走 `emitter.subAgentEnd`。
 
 ### 3.3 证据表
 
 | 环节 | 位置 | 关键内容 |
 | --- | --- | --- |
-| 基类 | `story-video-agent/src/main/java/io/binghe/framework/ai/agent/base/BaseAgent.java:41` | `abstract class BaseAgent` |
-| 依赖 | `BaseAgent.java:43-55` | emitter/registry/queue/checkpoint/provider/retry/mappers/state |
-| 工具注册 | `BaseAgent.java:74-78` | `new ToolRegistry()` + `registerTools(registry)` |
-| 抽象钩子 | `BaseAgent.java:82-86` | `getAgentType/registerTools/buildSystemPrompt/buildContextPrompt/getAiFunctionKey` |
-| 入口 | `BaseAgent.java:89-101` | `onMessage(userMessage)` |
-| 循环 | `BaseAgent.java:111-115` | `executeWithToolLoop(...)`，`maxIterations = 20` |
-| 调 LLM | `BaseAgent.java:125` | `provider.invokeWithTools(request)` |
-| 无工具结束 | `BaseAgent.java:148` | `if (!response.hasToolCalls())` |
-| 遍历工具 | `BaseAgent.java:167-201` | 执行、落日志、回填 `toolResult` |
-| 查工具 | `BaseAgent.java:174` | `tools.getTool(toolCall.getName())` |
-| 事件 | `BaseAgent.java:180` | `emitter.toolCall(agentType, name, args)` |
-| 超限告警 | `BaseAgent.java:203` | 达到最大迭代 |
-| 子 Agent | `BaseAgent.java:207-230` | `invokeSubAgent(name, task, subSystemPrompt, subTools)` |
-| 控制 | `BaseAgent.java:238-268` | `onConnect/onDisconnect/cleanHistory/pause/resume/cancel/getState` |
-| 工具注册表 | `story-video-agent/src/main/java/io/binghe/framework/ai/agent/registry/ToolRegistry.java:18-36` | `register/getTool/getAllDefinitions/hasTool` |
-| 工具接口 | `story-video-agent/src/main/java/io/binghe/framework/ai/agent/tool/AgentTool.java:12-14` | `@FunctionalInterface Object execute(Map)` |
-| 小说主 Agent 注册 | `story-video-agent/src/main/java/io/binghe/framework/ai/agent/novel/NovelMainAgent.java:157-195` | 业务工具 + 7 个 `registerCallXxx` |
-| 子 Agent 工具集 | `NovelMainAgent.java:893-966` | `buildWorldArchitectTools` … `buildQualityInspectorTools` |
-| 编排实现 | `NovelMainAgent.java:983-1100` | `registerCallWorldArchitect` … `registerCallQualityInspector` |
-| 动态 Prompt | `NovelMainAgent.java:1047-1066` | `callNovelWriter` 用 `mapGenreToCode(project.getType())` 拼 `novel-gen-*` |
-| 大纲主 Agent | `story-video-agent/src/main/java/io/binghe/framework/ai/agent/outline/OutlineMainAgent.java:145-160` | 业务工具 + 3 个 `registerCallXxx` |
-| 大纲子工具集 | `OutlineMainAgent.java:376-383` | `buildSubAgentTools()`（仅读+写故事线/大纲） |
-| 大纲编排 | `OutlineMainAgent.java:387-425` | storyteller / outliner / director |
+| 运行时骨架 | `story-video-agent/.../agent/base/BaseAgent.java:41-55` | 依赖：provider/retry/chatHistory/agentLog/checkpoint/emitter |
+| 工具注册表 | `BaseAgent.java:74` | `new ToolRegistry()` |
+| 注册钩子 | `BaseAgent.java:78-86` | `registerTools(...)`、`getAgentType()`、`getAiFunctionKey()` |
+| 入口 | `BaseAgent.java:88-108` | `onMessage`，`synchronized` + `MessageQueue` 排队 |
+| 工具循环 | `BaseAgent.java:110-202` | `executeWithToolLoop`，`maxIterations=20` |
+| LLM 调用（带重试） | `BaseAgent.java:121-130` | `aiRetryTemplate.execute(() -> provider.invokeWithTools(...))` |
+| 无工具结束 | `BaseAgent.java:146-155` | `responseEnd` / `subAgentEnd` |
+| 工具执行 | `BaseAgent.java:165-198` | `getTool` → `execute` → `toolResult` 入 messages |
+| 达上限 | `BaseAgent.java:201` | 仅 `log.warn`，不发完成事件 |
+| 子 Agent | `BaseAgent.java:205-233` | `invokeSubAgent`（同步），取末条 assistant |
+| 声明周期 | `BaseAgent.java:236-247` | `onConnect`/`onDisconnect`/`cleanHistory` |
+| 中断控制 | `BaseAgent.java:250-263` | `pause`/`resume`/`cancel` |
+| 队列消费 | `BaseAgent.java:275-282` | `processNextInQueue` |
+| 历史加载 | `BaseAgent.java:284-...` | `loadHistory`（`t_chat_history`，按 projectId+type） |
+| 工具注册表 | `.../agent/registry/ToolRegistry.java:18-37` | `register`/`getTool`/`getAllDefinitions`/`hasTool` |
+| 工具接口 | `.../agent/tool/AgentTool.java:12-14` | `@FunctionalInterface execute(Map)` |
+| 消息队列 | `.../agent/queue/MessageQueue.java` | 简单 FIFO |
+| 小说主 Agent | `.../agent/novel/NovelMainAgent.java:157-195` | 注册 7 个子 Agent 入口 |
+| 子 Agent 工具构建 | `NovelMainAgent.java:893-966` | `buildXxxTools` |
+| 子 Agent 入口 | `NovelMainAgent.java:983-1100` | `registerCallXxx` |
+| 大纲主 Agent | `.../agent/outline/OutlineMainAgent.java:145-160,376-419` | 子 Agent 编排 |
+| 断点 | `.../agent/checkpoint/CheckpointManager.java` | `t_task_list.checkpoint` |
+| 事件 | `.../agent/emitter/AgentEmitter.java:21-86` | 主题 + `stream/responseEnd/subAgentStream/toolCall/transfer/...` |
 
 ---
 
@@ -86,47 +109,132 @@ for i in 0..19:                 # maxIterations = 20
 
 | 选择 | 理由 | 代价 |
 | --- | --- | --- |
-| 手写工具循环（非框架） | 可控、无额外依赖 | 需自行处理并发、超时、状态 |
-| `maxIterations=20` | 防止死循环 | 复杂任务可能提前截断 |
-| 子 Agent 工具集裁剪 | 防递归、符合职责最小权限 | 工具集维护成本高 |
-| 工具 = Lambda（`AgentTool`） | 注册简洁 | 复杂工具内联代码量大（`NovelMainAgent` 达 ~1159 行） |
-| 子 Agent 共享 `executeWithToolLoop` | 复用循环 | 子 Agent 无独立 `maxIterations` 配置 |
+| 工具即 `@FunctionalInterface` | 工具=一段可执行逻辑，注册简单 | 无强类型参数校验，靠工具自身解析 |
+| 子 Agent 用「入口工具」暴露给 LLM | LLM 只认函数名，天然可编排 | 必须严格裁剪子 Agent 工具集 |
+| 子 Agent 同步调用 | 时序简单、结果直接回填 | 主 Agent 阻塞；子 Agent 慢会拖长主循环 |
+| `synchronized` + `MessageQueue` | 单实例串行，避免上下文交叉 | 排队消息无超时/无优先级 |
+| 每轮工具结果全量入 messages | 模型能看到全部事实 | token 线性增长，20 轮易超限 |
+| 循环上限仅告警 | 避免抛错中断 | 用户侧看不到「为什么没结果」 |
 
 ---
 
 ## 5. 关键工程实现
 
-**（1）循环 + 工具结果回填（`BaseAgent.java:111-201`）**：每次把 `assistant.tool_calls` 和 `tool.toolResult` 追加进 `messages`，形成标准 OpenAI 工具调用序列。【代码事实】
+**（1）工具循环主干（`BaseAgent.java:110-202`）**
 
-**（2）权限分级（`NovelMainAgent.java:932-941`）**：
 ```java
-private ToolRegistry buildNovelWriterTools() {
-    ToolRegistry sub = new ToolRegistry();
-    registerGetCharacters(sub);
-    registerGetChapterPlan(sub);
-    registerSaveChapter(sub);
-    // 注意：不注册任何 callXxx，子 Agent 无法再编排
-    return sub;
+private void executeWithToolLoop(List<ChatMessage> messages, ToolRegistry tools, boolean isSubAgent) {
+    int maxIterations = 20;
+    for (int i = 0; i < maxIterations; i++) {
+        AiRequest request = buildAiRequest(messages, tools);
+        TextAiProvider provider = aiProviderService.getTextProvider(getAiFunctionKey());
+        AiResponse response;
+        try {
+            response = aiRetryTemplate.execute(() -> provider.invokeWithTools(request),
+                                               getAgentType() + ".llmCall");
+        } catch (Exception e) {                       // 失败落日志 + 推前端，直接返回
+            emitter.error("AI调用失败: " + e.getMessage());
+            logAction("llmCall", ..., "failed", e.getMessage(), null);
+            return;
+        }
+        if (!response.hasToolCalls()) {               // 正常终止
+            messages.add(ChatMessage.assistant(response.getContent()));
+            if (isSubAgent) emitter.subAgentEnd(getAgentType());
+            else            emitter.responseEnd(response.getContent());
+            return;
+        }
+        for (ToolCall toolCall : response.getToolCalls()) {
+            AgentTool tool = tools.getTool(toolCall.getName());
+            Object result = tool == null ? "Error: unknown tool '" + toolCall.getName() + "'"
+                                         : tool.execute(objectMapper.readValue(toolCall.getArguments(), ...));
+            messages.add(ChatMessage.toolResult(toolCall.getId(), objectMapper.writeValueAsString(result)));
+        }
+    }
+    log.warn("[{}] Tool loop reached max iterations for project={}", getAgentType(), projectId);
 }
 ```
-`【工程推断】` 这是防止「子 Agent → 子 Agent」无限递归的关键手段。
 
-**（3）动态组合 Prompt（`NovelMainAgent.java:1047-1066`）**：`callNovelWriter` 依据作品类型动态拼接体裁 prompt（`mapGenreToCode`）。
+**（2）权限分级：子 Agent 工具集不含 `callXxx`（`NovelMainAgent.java:157-195`）**
+
+主 Agent 注册业务工具 + 7 个「调用子 Agent」入口；子 Agent 只注册业务工具。**这样 LLM 即使想递归，也没有可调用的函数名**。
+
+**（3）子 Agent 同步取结果（`BaseAgent.java:205-233`）**
+
+```java
+protected String invokeSubAgent(String subAgentName, String task, String subSystemPrompt, ToolRegistry subTools) {
+    emitter.transfer(subAgentName);
+    List<ChatMessage> subHistory = new ArrayList<>();
+    subHistory.add(ChatMessage.system(subSystemPrompt));
+    subHistory.add(ChatMessage.user(task));
+    executeWithToolLoop(subHistory, subTools, true);
+    for (int i = subHistory.size() - 1; i >= 0; i--) {   // 取最后一条 assistant
+        if ("assistant".equals(subHistory.get(i).getRole())) return subHistory.get(i).getContent();
+    }
+    return "";
+}
+```
+
+**（4）单实例串行 + 排队（`BaseAgent.java:88-108,275-282`）**：`synchronized(this)` 判断 `RUNNING`，是则入队；`finally` 里置 `IDLE` 并 `processNextInQueue`。
 
 ---
 
 ## 6. 踩坑根因排障
 
+### 6.1 【代码事实】`pause()` / `cancel()` 无法中断正在跑的工具循环
+
+```java
+public void pause()  { state = AgentState.PAUSED; checkpointManager.save(...); }
+public void cancel() { state = AgentState.IDLE; messageQueue.clear(); }
+```
+但 `executeWithToolLoop` 的 `for` 循环体里**从不读取 `state`**。也就是说：
+
+- 循环跑到第 10 轮时调 `pause()`，第 11-20 轮照跑；
+- `cancel()` 只是清空**待处理队列**并置 IDLE，正在执行的循环不受影响；
+- 更糟的是 `cancel()` 置 `IDLE` 后，`finally` 里也会置 `IDLE` 并 `processNextInQueue()`，若期间有并发 `onMessage`，可能出现状态竞争。
+
+**修复方向**：在循环每次迭代开头检查 `if (state == PAUSED/CANCELLED) return;`，或用 `volatile` + `CancellationToken`。
+
+### 6.2 【代码事实】达 20 轮上限不报错、不通知
+
+```java
+log.warn("[{}] Tool loop reached max iterations ...");
+```
+循环耗尽后方法直接返回：**不发 `responseEnd`，不推 `error`，不落失败日志**。前端表现为「一直转圈直到超时」，排障时需去服务端日志找这行 `max iterations`。
+
+### 6.3 【代码事实】工具结果全量入 messages → 20 轮后 token 爆炸
+
+每轮把所有工具的完整结果（可能是整章正文）追加进 `messages`，且 `buildAiRequest` 每轮把整个 `messages` 重新发上游。轮次越多，请求越大，容易触发超长/超费。建议对旧工具结果做摘要或截断。
+
+### 6.4 【代码事实】「查不到工具」与「工具执行异常」都只是文本回给模型
+
+`tool == null` 或 `execute` 抛异常时，都只是把一段 `Error ...` 文本作为 `toolResult` 回填，**不中断循环**。模型可能反复调用同一个不存在的工具直到 20 轮耗尽。
+
+### 6.5 【代码事实】两套同名「死代码」易误导
+
+仓库里存在两组同名类：
+
+| 类别 | 实际使用（被 `BaseAgent` 引用） | 死代码（0 引用） |
+| --- | --- | --- |
+| 工具注册表 | `agent/registry/ToolRegistry` | `agent/core/ToolRegistry` |
+| 工具接口 | `agent/tool/AgentTool` | `agent/core/AgentTool` |
+| 消息队列 | `agent/queue/MessageQueue` | `agent/core/MessageQueue` |
+
+改造时若改到 `agent/core/*`，**不生效**。排查时应以 import 为准。
+
+### 6.6 【代码事实】子 Agent 是同步调用 → 主循环被长时间阻塞
+
+`invokeSubAgent` 直接在当前线程跑子 Agent 的工具循环。若子 Agent 内部又发起多次 LLM 调用（如逐章写小说），主 Agent 会**长时间卡住**，且第 07 篇的 `AgentSession` 单实例锁会让该会话期间无法处理新消息。
+
+### 6.7 常见现象对照表
+
 | 现象 | 根因 | 排查/处理 |
 | --- | --- | --- |
-| Agent 陷入工具死循环 | 无 `maxIterations` 或工具总返回「继续」 | 已有 20 轮上限；检查工具返回语义 |
-| 子 Agent 又调子 Agent | 子工具集误注册了 `call*` | 审查各 `buildXxxTools()` |
-| 工具调用报「unknown tool」 | LLM 幻觉出未注册工具名 | `BaseAgent.java:175-178` 会记 failed 并回填错误 |
-| 复杂任务被截断 | 20 轮不够 | 调大上限或拆分任务 |
-| `NovelMainAgent` 难维护 | 单类 ~1159 行 | 按工具组拆分到多个 `*Tools` 装配类 |
-| 找不到实际使用的类 | **同名死代码** | `agent/core/{ToolRegistry,AgentTool,MessageQueue}` 全仓 0 引用；真正在用的是 `registry/tool/queue` 下同名类 |
-
-> ⚠️ **重要**：项目里存在**两组同名的工具/队列类**，其中 `agent/core/` 一组是死代码。迁移或阅读时务必认准 `agent/registry/ToolRegistry`、`agent/tool/AgentTool`、`agent/queue/MessageQueue`。【代码事实】
+| 点暂停/取消无效 | 循环不读 state（§6.1） | 循环内检查状态 |
+| 前端一直转圈无结果 | 达 20 轮仅 warn（§6.2） | 查 `max iterations` 日志 |
+| 请求越来越慢/超长 | 工具结果线性累积（§6.3） | 截断/摘要旧结果 |
+| 模型反复调不存在的工具 | 错误只作文本回填（§6.4） | 未知工具立即终止或纠偏 |
+| 改了工具注册但不生效 | 改到 `agent/core/*` 死代码（§6.5） | 核对 import 路径 |
+| 长任务期间发新消息无反应 | 子 Agent 同步 + 单实例锁（§6.6） | 子 Agent 异步化或加超时 |
 
 ---
 
@@ -134,12 +242,13 @@ private ToolRegistry buildNovelWriterTools() {
 
 `【落地建议】`
 
-1. **工具循环骨架**：`请求 → 有 tool_calls？→ 执行 → 回填 → 再请求`，设 `maxIterations`（建议 10~30）与总超时。
-2. **工具注册表**：`name → (executor, ToolDefinition)`，`getAllDefinitions()` 直接喂给 LLM。
-3. **子 Agent 权限分级**：子 Agent 的工具集 = 主工具集 **减去所有编排类工具**，实现职责最小权限。
-4. **每步可观测**：工具调用名称/参数/结果/耗时/状态落审计表，便于复盘。
-5. **控制面**：提供 pause/resume/cancel 与状态查询。
-6. **拆分大 Agent**：单个 Agent 超过 ~500 行就该按工具组拆分装配。
+1. **工具循环必须有三种出口**：正常结束（无 tool_calls）、优雅失败（错误）、超限终止（达 maxIterations）——三种都要通知调用方、落日志，不能静默 return。
+2. **子 Agent 权限靠「不注册」而非「运行时校验」**：子 Agent 的工具集直接不含入口工具，从源头杜绝递归；比在 `invokeSubAgent` 里判断更可靠。
+3. **循环内可中断**：每次迭代检查取消/暂停标志；用 `CancellationToken` 或 `volatile`。
+4. **上下文治理**：只保留最近 N 轮完整工具结果，更早的做摘要/落盘引用；避免 token 线性增长。
+5. **未知工具/工具异常要显式纠正**：把错误文本回填可以，但要加「同一工具连续失败 N 次即终止」的保护。
+6. **可观测优先**：LLM 调用、工具调用、子 Agent 调用都落结构化日志（本仓 `t_agent_log` 是好实践），并带 parent 关联（`parentLogId`）形成调用树。
+7. **子 Agent 考虑异步/并行**：子任务间无依赖时可并行，主循环用「等待全部子任务」而非逐个同步。
 
 ---
 
@@ -147,28 +256,32 @@ private ToolRegistry buildNovelWriterTools() {
 
 | 方案 | 适用 | 不适用 |
 | --- | --- | --- |
-| 手写循环（本方案） | 需精细控制、无框架依赖 | 复杂多 Agent 图 |
-| Spring AI / LangChain4j | 快速接入、内置工具循环 | 需深度定制 |
-| 状态图工作流（LangGraph 类） | 多 Agent 编排、可回放 | 引入新范式成本 |
-| 纯编排（无 LLM 循环） | 流程固定 | 需模型自主决策 |
+| 手写工具循环（本方案） | 需要精细控制、事件推送 | 需求复杂时易失控 |
+| LangChain4j / Spring AI Agent | 快速搭建、生态工具多 | 抽象泄漏、定制难 |
+| 图编排（LangGraph / 状态图） | 复杂多 Agent 图、条件分支 | 引入较重 |
+| 纯 Prompt 编排（让模型自己分步） | 简单任务 | 不可控、难观测 |
+| 事件驱动 Agent（MQ） | 多实例、可伸缩 | 时序复杂度上升 |
 
 ---
 
 ## 9. 验收清单
 
-- [ ] LLM 返回 `tool_calls` 后工具被正确执行并回填。
-- [ ] 无工具调用时循环终止并输出结果。
-- [ ] 达到 20 轮有明确告警。
-- [ ] 子 Agent 无法调用任何 `call*` 工具（工具集已裁剪）。
-- [ ] 每次工具调用在 `t_agent_log` 有记录（名称/参数/结果/耗时/状态）。
-- [ ] pause/resume/cancel 生效。
-- [ ] 未注册工具名返回 `Error: unknown tool` 而非崩溃。
+- [ ] 无工具调用时正常结束并推 `responseEnd`/`subAgentEnd`。
+- [ ] 有工具调用时执行、回填、继续下一轮。
+- [ ] 达 `maxIterations` 时**有**错误通知与日志。
+- [ ] 子 Agent 工具集**不含**任何入口工具（无递归）。
+- [ ] `pause`/`cancel` 能在循环中生效。
+- [ ] 排队消息在上一任务结束后被处理。
+- [ ] 未知工具/工具异常有次数上限保护。
+- [ ] `t_agent_log` 有 `llmCall`/`toolCall`/`invokeSubAgent` 且带父子关联。
+- [ ] 长循环下请求 token 不无限增长。
 
 ---
 
 ## 10. 待确认项
 
-- 子 Agent 是否可配置独立 `maxIterations`（当前共用基类默认值）。【待确认】
-- `invokeSubAgent` 的返回解析（取子历史最后一条 assistant）是否健壮。【待确认】
-- `agent/core/` 死代码是否计划删除。【待确认】
-- `NovelMainAgent` 7 个子 Agent 的 system prompt 是否全部由 `PromptService` 提供（见第 09 篇）。【待确认】
+- `pause`/`cancel` 是否在运行期被实际调用（若无人调用，§6.1 影响有限）。【待确认】
+- `MessageQueue` 是否有容量上限与超时。【待确认】
+- `buildAiRequest` 每次是否重复序列化大对象（性能）。【待确认】
+- 子 Agent 的 LLM functionKey 与主 Agent 是否共用同一模型配置。【待确认】
+- `agent/core/*` 死代码是否计划清理。【待确认】
