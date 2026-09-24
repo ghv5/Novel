@@ -1,0 +1,7 @@
+# Generated documentation publication artifacts
+.publish/
+.publish-venv/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]

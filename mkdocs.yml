@@ -1,0 +1,60 @@
+site_name: "Novel"
+site_url: "https://docs.gmy.zone/novel/"
+site_description: "像看小说一样学习"
+docs_dir: .publish/docs
+site_dir: .publish/site
+use_directory_urls: true
+hooks:
+  - scripts/mkdocs_hooks.py
+
+theme:
+  name: material
+  language: zh
+  font: false
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra_css:
+  - stylesheets/layout.css
+
+extra:
+  generator: false
