@@ -1,0 +1,11 @@
+# 文档发布安全边界：这些文件的修改必须由指定 owner 审核。
+/.github/CODEOWNERS @ghv5
+/.github/workflows/ @ghv5
+/.coveragerc @ghv5
+/docs/stylesheets/layout.css @ghv5
+/mkdocs.yml @ghv5
+/publish-files.txt @ghv5
+/requirements-docs.in @ghv5
+/requirements-docs.txt @ghv5
+/scripts/ @ghv5
+/tests/ @ghv5
